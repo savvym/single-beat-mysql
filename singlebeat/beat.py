@@ -9,7 +9,6 @@ import logging
 import signal
 import asyncio
 import pymysql
-import aiomysql
 from urllib.parse import urlparse
 
 
@@ -96,18 +95,6 @@ class Config(object):
         finally:
             conn.close()
 
-    async def get_async_mysql_pool(self):
-        """获取异步MySQL连接池"""
-        config = self.parse_mysql_url()
-        return await aiomysql.create_pool(
-            host=config['host'],
-            port=config['port'],
-            user=config['user'],
-            password=config['password'],
-            db=config['db'],
-            autocommit=True,
-        )
-
     def get_host_identifier(self):
         """\
         we try to return IPADDR:PID form to identify where any singlebeat instance is
@@ -134,7 +121,6 @@ class Config(object):
 
 
 config = Config()
-config.ensure_table_exists()
 config.checks()
 
 numeric_log_level = getattr(logging, config.LOG_LEVEL.upper(), None)
@@ -173,23 +159,19 @@ class Process(object):
 
         self.identifier = config.IDENTIFIER or get_process_identifier(self.args[1:])
         self.ioloop = asyncio.get_running_loop()
-        
+
         for signame in {"SIGINT", "SIGTERM"}:
             sig = getattr(signal, signame)
             self.ioloop.add_signal_handler(
                 sig, functools.partial(self.sigterm_handler, sig, self.ioloop)
             )
 
-        self.mysql_pool = None
-        self.command_queue = asyncio.Queue()
         self.fence_token = 0
         self.sprocess = None
         self.pc = None
         self.state = State.WAITING
         self._periodic_callback_running = True
         self.child_exit_cb = self.proc_exit_cb
-        self.last_command_check = 0
-        self.command_check_interval = 1  # 每秒检查一次命令
 
     def proc_exit_cb(self, exit_status):
         """When child exits we use the same exit status code"""
@@ -226,7 +208,7 @@ class Process(object):
         pass
 
     async def timer_cb_waiting(self):
-        if await self.acquire_lock():
+        if self.acquire_lock():
             logger.info(f"acquired lock, {self.identifier} spawning child process")
             return self.ioloop.create_task(self.spawn_process())
         # couldn't acquire lock
@@ -249,39 +231,35 @@ class Process(object):
         return -1
 
     async def timer_cb_running(self):
-        if not self.mysql_pool:
-            self.mysql_pool = await config.get_async_mysql_pool()
-            
-        # 读取当前fence token
-        async with self.mysql_pool.acquire() as conn:
-            async with conn.cursor() as cursor:
-                await cursor.execute("SELECT `data` FROM SingleBeat WHERE `key` = %s", 
+        conn = config.get_mysql_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT `data` FROM SingleBeat WHERE `key` = %s", 
                                    [f"SINGLE_BEAT_{self.identifier}"])
-                row = await cursor.fetchone()
-                
-                if row:
-                    redis_fence_token = int(row['data'].split(":")[0])
-                else:
-                    logger.error(
-                        "fence token could not be read from MySQL - assuming lock expired, trying to reacquire lock"
-                    )
-                    if await self.acquire_lock():
-                        logger.info("reacquired lock")
-                        redis_fence_token = self.fence_token
-                    else:
-                        logger.error("unable to reacquire lock, terminating")
-                        os.kill(os.getpid(), signal.SIGTERM)
-
-                logger.debug(
-                    "expected fence token: {} fence token read from MySQL: {}".format(
-                        self.fence_token, redis_fence_token
-                    )
+            row = cursor.fetchone()
+            if row:
+                logger.info(f"row: {row}")
+                fence_token = int(row[0].split(":")[0])
+            else:
+                logger.error(
+                    "fence token could not be read from DB - assuming lock expired, trying to reacquire lock"
                 )
+                if self.acquire_lock():
+                    logger.info("reacquired lock")
+                    fence_token = self.fence_token
+                else:
+                    logger.error("unable to reacquire lock, terminating")
+                    os.kill(os.getpid(), signal.SIGTERM)
 
-                if self.fence_token == redis_fence_token:
-                    self.fence_token += 1
-                    expire_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + config.LOCK_TIME))
-                    await cursor.execute(
+            logger.debug(
+                "expected fence token: {} fence token read from DB: {}".format(
+                    self.fence_token, fence_token
+                )
+            )
+
+            if self.fence_token == fence_token:
+                self.fence_token += 1
+                expire_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + config.LOCK_TIME))
+                cursor.execute(
                         "UPDATE SingleBeat SET `data` = %s, `expire_at` = %s WHERE `key` = %s",
                         [
                             "{}:{}:{}".format(
@@ -291,12 +269,13 @@ class Process(object):
                             f"SINGLE_BEAT_{self.identifier}"
                         ]
                     )
-                else:
-                    logger.error(
-                        "fence token did not match - lock is held by another process, terminating"
-                    )
-                    # send sigterm to ourself and let the sigterm_handler do the rest
-                    os.kill(os.getpid(), signal.SIGTERM)
+                conn.commit()
+            else:
+                logger.error(
+                    "fence token did not match - lock is held by another process, terminating"
+                )
+                # send sigterm to ourself and let the sigterm_handler do the rest
+                os.kill(os.getpid(), signal.SIGTERM)
 
     async def timer_cb_restarting(self):
         """\
@@ -311,33 +290,32 @@ class Process(object):
         self.t1 = time.time()
         fn = getattr(self, "timer_cb_{}".format(self.state.lower()))
         await fn()
-        
-        # 检查是否有命令需要执行
-        await self.check_commands()
 
-    async def acquire_lock(self):
-        if not self.mysql_pool:
-            self.mysql_pool = await config.get_async_mysql_pool()
-            
-        async with self.mysql_pool.acquire() as conn:
-            async with conn.cursor() as cursor:
-                # 先清理过期的锁
-                await cursor.execute("DELETE FROM SingleBeat WHERE `key` = %s AND `expire_at` < NOW()", 
-                                   [f"SINGLE_BEAT_{self.identifier}"])
-                
+    def acquire_lock(self):
+        conn = config.get_mysql_connection()
+        try:
+            with conn.cursor() as cursor:
+                now = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))
+                cursor.execute("DELETE FROM SingleBeat WHERE `key` = %s AND `expire_at` < %s",
+                               [f"SINGLE_BEAT_{self.identifier}", f"{now}"])
                 # 尝试获取锁
                 expire_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + config.INITIAL_LOCK_TIME))
-                await cursor.execute(
+                cursor.execute(
                     "INSERT IGNORE INTO SingleBeat (`key`, `data`, `expire_at`) VALUES (%s, %s, %s)",
                     [
-                        f"SINGLE_BEAT_{self.identifier}", 
+                        f"SINGLE_BEAT_{self.identifier}",
                         "{}:{}:{}".format(self.fence_token, config.HOST_IDENTIFIER, 0),
                         expire_time
                     ]
                 )
-                
+                conn.commit()
                 # 确认是否获取到锁
                 return cursor.rowcount > 0
+        except Exception as e:
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
 
     def sigterm_handler(self, signum, loop):
         """When we get term signal
@@ -366,7 +344,6 @@ class Process(object):
         self._periodic_callback_running = False
 
     async def run(self):
-        self.mysql_pool = await config.get_async_mysql_pool()
         while self._periodic_callback_running:
             await self.timer_cb()
             await asyncio.sleep(config.HEARTBEAT_INTERVAL)
@@ -411,147 +388,8 @@ class Process(object):
         except SystemExit as e:
             os._exit(e.code)
 
-    def cli_command_info(self, msg):
-        info = ""
-        if self.sprocess:
-            if is_process_alive(self.sprocess.pid):
-                info = "pid: {}".format(self.sprocess.pid)
-        return info
-
     def child_process_alive(self):
         return not self.sprocess.protocol._process_exited
-
-    def cli_command_quit(self, msg):
-        """\
-        kills the child and exits
-        """
-        if self.state == State.RUNNING and self.sprocess and self.child_process_alive():
-            self.sprocess.kill()
-        else:
-            sys.exit(0)
-
-    def cli_command_pause(self, msg):
-        """\
-        if we have a running child we kill it and set our state to paused
-        if we don't have a running child, we set our state to paused
-        this will pause all the nodes in single-beat cluster
-
-        its useful when you deploy some code and don't want your child to spawn
-        randomly
-
-        :param msg:
-        :return:
-        """
-        info = ""
-        if self.state == State.RUNNING and self.sprocess and self.child_process_alive():
-            self.child_exit_cb = self.proc_exit_cb_noop
-            self.sprocess.kill()
-            info = "killed"
-        self.state = State.PAUSED
-        return info
-
-    def cli_command_resume(self, msg):
-        """\
-        sets state to waiting - so we resume spawning children
-        """
-        if self.state == State.PAUSED:
-            self.state = State.WAITING
-
-    def cli_command_stop(self, msg):
-        """\
-        stops the running child process - if its running
-        it will re-spawn in any single-beat node after sometime
-
-        :param msg:
-        :return:
-        """
-        info = ""
-        if self.state == State.RUNNING and self.sprocess and self.sprocess.proc:
-            self.state = State.PAUSED
-            self.sprocess.kill()
-            info = "killed"
-        return info
-
-    def cli_command_restart(self, msg):
-        """\
-        restart the subprocess
-        i. we set our state to RESTARTING - on restarting we still send heartbeat
-        ii. we kill the subprocess
-        iii. we start again
-        iv. if its started we set our state to RUNNING, else we set it to WAITING
-
-        :param msg:
-        :return:
-        """
-        info = ""
-        if self.state == State.RUNNING and self.sprocess and self.sprocess.proc:
-            self.state = State.RESTARTING
-            self.child_exit_cb = self.proc_exit_cb_restart
-            self.sprocess.kill()
-            info = "killed"
-        return info
-    
-    async def check_commands(self):
-        """检查MySQL中是否有命令需要执行"""
-        # 每秒只检查一次命令，避免过多查询
-        current_time = time.time()
-        if current_time - self.last_command_check < self.command_check_interval:
-            return
-            
-        self.last_command_check = current_time
-        
-        if not self.mysql_pool:
-            self.mysql_pool = await config.get_async_mysql_pool()
-            
-        async with self.mysql_pool.acquire() as conn:
-            async with conn.cursor() as cursor:
-                # 查询命令
-                await cursor.execute(
-                    "SELECT `data` FROM SingleBeat WHERE `key` = %s",
-                    [f"SB_{self.identifier}"]
-                )
-                row = await cursor.fetchone()
-                
-                if row and row['data']:
-                    # 处理命令
-                    await self.pubsub_callback(row['data'])
-                    # 处理完后清除命令
-                    await cursor.execute(
-                        "DELETE FROM SingleBeat WHERE `key` = %s",
-                        [f"SB_{self.identifier}"]
-                    )
-
-    async def pubsub_callback(self, data_str):
-        logger.info("got command - %s", data_str)
-        
-        try:
-            cmd = json.loads(data_str)
-        except:
-            logger.exception("exception on parsing command %s", data_str)
-            return
-
-        fn = getattr(self, "cli_command_{}".format(cmd["cmd"]), None)
-        if not fn:
-            logger.info("cli_command_{} not found".format(cmd["cmd"]))
-            return
-
-        logger.info("got command - %s running %s", data_str, fn)
-        info = fn(cmd)
-        
-        if 'reply_channel' in cmd:
-            async with self.mysql_pool.acquire() as conn:
-                async with conn.cursor() as cursor:
-                    await cursor.execute(
-                        "INSERT INTO SingleBeat (`key`, `data`) VALUES (%s, %s) ON DUPLICATE KEY UPDATE `data` = VALUES(`data`)",
-                        [
-                            cmd["reply_channel"],
-                            json.dumps({
-                                "identifier": config.get_host_identifier(),
-                                "state": self.state,
-                                "info": info or "",
-                            })
-                        ]
-                    )
 
     def forward_stdout(self, buf):
         self.stdout_read_cb(buf)
