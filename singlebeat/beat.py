@@ -237,8 +237,7 @@ class Process(object):
                                    [f"SINGLE_BEAT_{self.identifier}"])
             row = cursor.fetchone()
             if row:
-                logger.info(f"row: {row}")
-                fence_token = int(row[0].split(":")[0])
+                fence_token = int(row['data'].split(":")[0])
             else:
                 logger.error(
                     "fence token could not be read from DB - assuming lock expired, trying to reacquire lock"
