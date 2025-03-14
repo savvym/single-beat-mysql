@@ -22,7 +22,7 @@ def env(identifier, default, type=noop):
 
 
 class Config(object):
-    MYSQL_URL = env('MYSQL_URL', 'mysql://root:zhd961024@127.0.0.1:3306/chore_task')
+    MYSQL_URL = env('MYSQL_URL', 'mysql://root:123456@127.0.0.1:3306/chore_task')
     IDENTIFIER = env('IDENTIFIER', None)
     LOCK_TIME = env('LOCK_TIME', 5, int)
     INITIAL_LOCK_TIME = env('INITIAL_LOCK_TIME', LOCK_TIME * 2, int)
