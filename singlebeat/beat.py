@@ -5,12 +5,12 @@ import os
 import sys
 import time
 import socket
-import redis
-import redis.sentinel
 import logging
 import signal
 import asyncio
-from redis import asyncio as aioredis
+import pymysql
+import aiomysql
+from urllib.parse import urlparse
 
 
 def noop(i):
@@ -22,12 +22,7 @@ def env(identifier, default, type=noop):
 
 
 class Config(object):
-    REDIS_SERVER = env('REDIS_SERVER', 'redis://localhost:6379')
-    REDIS_PASSWORD = env('REDIS_PASSWORD', None)
-    REDIS_SENTINEL = env('REDIS_SENTINEL', None)
-    REDIS_SENTINEL_MASTER = env('REDIS_SENTINEL_MASTER', 'mymaster')
-    REDIS_SENTINEL_DB = env('REDIS_SENTINEL_DB', 0)
-    REDIS_SENTINEL_PASSWORD = env('REDIS_SENTINEL_PASSWORD', None)
+    MYSQL_URL = env('MYSQL_URL', 'mysql://root:zhd961024@127.0.0.1:3306/chore_task')
     IDENTIFIER = env('IDENTIFIER', None)
     LOCK_TIME = env('LOCK_TIME', 5, int)
     INITIAL_LOCK_TIME = env('INITIAL_LOCK_TIME', LOCK_TIME * 2, int)
@@ -38,6 +33,7 @@ class Config(object):
     WAIT_MODE = env("WAIT_MODE", "heartbeat")
     WAIT_BEFORE_DIE = env("WAIT_BEFORE_DIE", 60, int)
     _host_identifier = None
+    _mysql_config = None
 
     def check(self, cond, message):
         if not cond:
@@ -53,49 +49,64 @@ class Config(object):
             "SINGLE_BEAT_HEARTBEAT_INTERVAL must be smaller than SINGLE_BEAT_LOCK_TIME / 2",
         )
         self.check(self.WAIT_MODE in ("supervised", "heartbeat"), "undefined wait mode")
-        if self.REDIS_SENTINEL:
-            master = self._sentinel.discover_master(self.REDIS_SENTINEL_MASTER)
-        else:
-            self._redis.ping()
+        
+        # 检查MySQL连接
+        conn = self.get_mysql_connection()
+        conn.ping()
+        conn.close()
 
-    def get_redis(self):
-        if self.REDIS_SENTINEL:
-            return self._sentinel.master_for(self.REDIS_SENTINEL_MASTER,
-                                             password=self.REDIS_PASSWORD,
-                                             redis_class=redis.Redis)
-        return self._redis
+    def parse_mysql_url(self):
+        """解析MySQL URL并返回连接参数"""
+        if not self._mysql_config:
+            parsed = urlparse(self.MYSQL_URL)
+            self._mysql_config = {
+                'host': parsed.hostname or '127.0.0.1',
+                'port': parsed.port or 3306,
+                'user': parsed.username or 'root',
+                'password': parsed.password or '',
+                'db': parsed.path.strip('/') or 'chore_task',
+            }
+        return self._mysql_config
 
-    def rewrite_redis_url(self):
-        """\
-        if REDIS_SERVER is just an ip address, then we try to translate it to
-        redis_url, redis://REDIS_SERVER so that it doesn't try to connect to
-        localhost while you try to connect to another server
-        :return:
-        """
-        if (
-            self.REDIS_SERVER.startswith("unix://")
-            or self.REDIS_SERVER.startswith("redis://")
-            or self.REDIS_SERVER.startswith("rediss://")
-        ):
-            return self.REDIS_SERVER
-        return "redis://{}/".format(self.REDIS_SERVER)
+    def get_mysql_connection(self):
+        """获取MySQL连接"""
+        config = self.parse_mysql_url()
+        return pymysql.connect(
+            host=config['host'],
+            port=config['port'],
+            user=config['user'],
+            password=config['password'],
+            database=config['db'],
+            cursorclass=pymysql.cursors.DictCursor
+        )
 
-    def __init__(self):
-        if self.REDIS_SENTINEL:
-            sentinels = [tuple(s.split(':')) for s in self.REDIS_SENTINEL.split(';')]
-            self._sentinel = redis.sentinel.Sentinel(sentinels,
-                                                     db=self.REDIS_SENTINEL_DB,
-                                                     socket_timeout=0.1,
-                                                     sentinel_kwargs={"password": self.REDIS_SENTINEL_PASSWORD}
-                                                     )
-        else:
-            self._redis = redis.Redis.from_url(self.rewrite_redis_url())
+    def ensure_table_exists(self):
+        """确保SingleBeat表存在"""
+        conn = self.get_mysql_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS SingleBeat (
+                    `key` VARCHAR(255) PRIMARY KEY,
+                    `data` TEXT,
+                    `expire_at` TIMESTAMP NULL
+                )
+                """)
+                conn.commit()
+        finally:
+            conn.close()
 
-    def get_async_redis_client(self):
-        conn = self.get_redis().connection_pool.get_connection("ping")
-        host, port, password = conn.host, conn.port, conn.password
-        r = aioredis.Redis(host=host, port=port, password=password)
-        return r.pubsub()
+    async def get_async_mysql_pool(self):
+        """获取异步MySQL连接池"""
+        config = self.parse_mysql_url()
+        return await aiomysql.create_pool(
+            host=config['host'],
+            port=config['port'],
+            user=config['user'],
+            password=config['password'],
+            db=config['db'],
+            autocommit=True,
+        )
 
     def get_host_identifier(self):
         """\
@@ -106,16 +117,24 @@ class Config(object):
         """
         if self._host_identifier:
             return self._host_identifier
-        local_ip_addr = (
-            self.get_redis()
-            .connection_pool.get_connection("ping")
-            ._sock.getsockname()[0]
-        )
+        
+        # 获取本地IP地址
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # 不需要真正连接
+            s.connect((self.parse_mysql_url()['host'], 1))
+            local_ip_addr = s.getsockname()[0]
+        except:
+            local_ip_addr = '127.0.0.1'
+        finally:
+            s.close()
+            
         self._host_identifier = "{}:{}".format(local_ip_addr, os.getpid())
         return self._host_identifier
 
 
 config = Config()
+config.ensure_table_exists()
 config.checks()
 
 numeric_log_level = getattr(logging, config.LOG_LEVEL.upper(), None)
@@ -154,20 +173,23 @@ class Process(object):
 
         self.identifier = config.IDENTIFIER or get_process_identifier(self.args[1:])
         self.ioloop = asyncio.get_running_loop()
-
+        
         for signame in {"SIGINT", "SIGTERM"}:
             sig = getattr(signal, signame)
             self.ioloop.add_signal_handler(
                 sig, functools.partial(self.sigterm_handler, sig, self.ioloop)
             )
 
-        self.async_redis = config.get_async_redis_client()
+        self.mysql_pool = None
+        self.command_queue = asyncio.Queue()
         self.fence_token = 0
         self.sprocess = None
         self.pc = None
         self.state = State.WAITING
         self._periodic_callback_running = True
         self.child_exit_cb = self.proc_exit_cb
+        self.last_command_check = 0
+        self.command_check_interval = 1  # 每秒检查一次命令
 
     def proc_exit_cb(self, exit_status):
         """When child exits we use the same exit status code"""
@@ -204,7 +226,7 @@ class Process(object):
         pass
 
     async def timer_cb_waiting(self):
-        if self.acquire_lock():
+        if await self.acquire_lock():
             logger.info(f"acquired lock, {self.identifier} spawning child process")
             return self.ioloop.create_task(self.spawn_process())
         # couldn't acquire lock
@@ -227,46 +249,54 @@ class Process(object):
         return -1
 
     async def timer_cb_running(self):
-        rds = config.get_redis()
-        # read current fence token
-        redis_fence_token = rds.get(
-            "SINGLE_BEAT_{identifier}".format(identifier=self.identifier)
-        )
+        if not self.mysql_pool:
+            self.mysql_pool = await config.get_async_mysql_pool()
+            
+        # 读取当前fence token
+        async with self.mysql_pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT `data` FROM SingleBeat WHERE `key` = %s", 
+                                   [f"SINGLE_BEAT_{self.identifier}"])
+                row = await cursor.fetchone()
+                
+                if row:
+                    redis_fence_token = int(row['data'].split(":")[0])
+                else:
+                    logger.error(
+                        "fence token could not be read from MySQL - assuming lock expired, trying to reacquire lock"
+                    )
+                    if await self.acquire_lock():
+                        logger.info("reacquired lock")
+                        redis_fence_token = self.fence_token
+                    else:
+                        logger.error("unable to reacquire lock, terminating")
+                        os.kill(os.getpid(), signal.SIGTERM)
 
-        if redis_fence_token:
-            redis_fence_token = int(redis_fence_token.split(b":")[0])
-        else:
-            logger.error(
-                "fence token could not be read from Redis - assuming lock expired, trying to reacquire lock"
-            )
-            if self.acquire_lock():
-                logger.info("reacquired lock")
-                redis_fence_token = self.fence_token
-            else:
-                logger.error("unable to reacquire lock, terminating")
-                os.kill(os.getpid(), signal.SIGTERM)
+                logger.debug(
+                    "expected fence token: {} fence token read from MySQL: {}".format(
+                        self.fence_token, redis_fence_token
+                    )
+                )
 
-        logger.debug(
-            "expected fence token: {} fence token read from Redis: {}".format(
-                self.fence_token, redis_fence_token
-            )
-        )
-
-        if self.fence_token == redis_fence_token:
-            self.fence_token += 1
-            rds.set(
-                "SINGLE_BEAT_{identifier}".format(identifier=self.identifier),
-                "{}:{}:{}".format(
-                    self.fence_token, config.HOST_IDENTIFIER, self.process_pid()
-                ),
-                ex=config.LOCK_TIME,
-            )
-        else:
-            logger.error(
-                "fence token did not match - lock is held by another process, terminating"
-            )
-            # send sigterm to ourself and let the sigterm_handler do the rest
-            os.kill(os.getpid(), signal.SIGTERM)
+                if self.fence_token == redis_fence_token:
+                    self.fence_token += 1
+                    expire_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + config.LOCK_TIME))
+                    await cursor.execute(
+                        "UPDATE SingleBeat SET `data` = %s, `expire_at` = %s WHERE `key` = %s",
+                        [
+                            "{}:{}:{}".format(
+                                self.fence_token, config.HOST_IDENTIFIER, self.process_pid()
+                            ),
+                            expire_time,
+                            f"SINGLE_BEAT_{self.identifier}"
+                        ]
+                    )
+                else:
+                    logger.error(
+                        "fence token did not match - lock is held by another process, terminating"
+                    )
+                    # send sigterm to ourself and let the sigterm_handler do the rest
+                    os.kill(os.getpid(), signal.SIGTERM)
 
     async def timer_cb_restarting(self):
         """\
@@ -281,17 +311,33 @@ class Process(object):
         self.t1 = time.time()
         fn = getattr(self, "timer_cb_{}".format(self.state.lower()))
         await fn()
+        
+        # 检查是否有命令需要执行
+        await self.check_commands()
 
-    def acquire_lock(self):
-        rds = config.get_redis()
-        return rds.execute_command(
-            "SET",
-            "SINGLE_BEAT_{}".format(self.identifier),
-            "{}:{}:{}".format(self.fence_token, config.HOST_IDENTIFIER, 0),
-            "NX",
-            "EX",
-            config.INITIAL_LOCK_TIME,
-        )
+    async def acquire_lock(self):
+        if not self.mysql_pool:
+            self.mysql_pool = await config.get_async_mysql_pool()
+            
+        async with self.mysql_pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                # 先清理过期的锁
+                await cursor.execute("DELETE FROM SingleBeat WHERE `key` = %s AND `expire_at` < NOW()", 
+                                   [f"SINGLE_BEAT_{self.identifier}"])
+                
+                # 尝试获取锁
+                expire_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + config.INITIAL_LOCK_TIME))
+                await cursor.execute(
+                    "INSERT IGNORE INTO SingleBeat (`key`, `data`, `expire_at`) VALUES (%s, %s, %s)",
+                    [
+                        f"SINGLE_BEAT_{self.identifier}", 
+                        "{}:{}:{}".format(self.fence_token, config.HOST_IDENTIFIER, 0),
+                        expire_time
+                    ]
+                )
+                
+                # 确认是否获取到锁
+                return cursor.rowcount > 0
 
     def sigterm_handler(self, signum, loop):
         """When we get term signal
@@ -320,6 +366,7 @@ class Process(object):
         self._periodic_callback_running = False
 
     async def run(self):
+        self.mysql_pool = await config.get_async_mysql_pool()
         while self._periodic_callback_running:
             await self.timer_cb()
             await asyncio.sleep(config.HEARTBEAT_INTERVAL)
@@ -400,7 +447,6 @@ class Process(object):
             self.child_exit_cb = self.proc_exit_cb_noop
             self.sprocess.kill()
             info = "killed"
-            # TODO: check if process is really dead etc.
         self.state = State.PAUSED
         return info
 
@@ -422,11 +468,8 @@ class Process(object):
         info = ""
         if self.state == State.RUNNING and self.sprocess and self.sprocess.proc:
             self.state = State.PAUSED
-            # TODO:
-            # self.sprocess.set_exit_callback(self.proc_exit_cb_state_set)
             self.sprocess.kill()
             info = "killed"
-            # TODO: check if process is really dead etc.
         return info
 
     def cli_command_restart(self, msg):
@@ -446,19 +489,45 @@ class Process(object):
             self.child_exit_cb = self.proc_exit_cb_restart
             self.sprocess.kill()
             info = "killed"
-            # TODO: check if process is really dead etc.
         return info
-
-    def pubsub_callback(self, msg):
-        logger.info("got command - %s", msg)
-
-        if msg["type"] != b"message":
+    
+    async def check_commands(self):
+        """检查MySQL中是否有命令需要执行"""
+        # 每秒只检查一次命令，避免过多查询
+        current_time = time.time()
+        if current_time - self.last_command_check < self.command_check_interval:
             return
+            
+        self.last_command_check = current_time
+        
+        if not self.mysql_pool:
+            self.mysql_pool = await config.get_async_mysql_pool()
+            
+        async with self.mysql_pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                # 查询命令
+                await cursor.execute(
+                    "SELECT `data` FROM SingleBeat WHERE `key` = %s",
+                    [f"SB_{self.identifier}"]
+                )
+                row = await cursor.fetchone()
+                
+                if row and row['data']:
+                    # 处理命令
+                    await self.pubsub_callback(row['data'])
+                    # 处理完后清除命令
+                    await cursor.execute(
+                        "DELETE FROM SingleBeat WHERE `key` = %s",
+                        [f"SB_{self.identifier}"]
+                    )
 
+    async def pubsub_callback(self, data_str):
+        logger.info("got command - %s", data_str)
+        
         try:
-            cmd = json.loads(msg["data"])
+            cmd = json.loads(data_str)
         except:
-            logger.exception("exception on parsing command %s", msg)
+            logger.exception("exception on parsing command %s", data_str)
             return
 
         fn = getattr(self, "cli_command_{}".format(cmd["cmd"]), None)
@@ -466,27 +535,23 @@ class Process(object):
             logger.info("cli_command_{} not found".format(cmd["cmd"]))
             return
 
-        logger.info("got command - %s running %s", msg["data"], fn)
+        logger.info("got command - %s running %s", data_str, fn)
         info = fn(cmd)
-        rds = config.get_redis()
-        logger.info("reply to %s", cmd["reply_channel"])
-        rds.publish(
-            cmd["reply_channel"],
-            json.dumps(
-                {
-                    "identifier": config.get_host_identifier(),
-                    "state": self.state,
-                    "info": info or "",
-                }
-            ),
-        )
-
-    async def wait_for_commands(self):
-        logger.info("subscribed to %s", "SB_{}".format(self.identifier))
-        await self.async_redis.subscribe("SB_{}".format(self.identifier))
-        logger.debug("subscribed to redis channel %s", "SB_{}".format(self.identifier))
-        async for msg in self.async_redis.listen():
-            self.pubsub_callback(msg)
+        
+        if 'reply_channel' in cmd:
+            async with self.mysql_pool.acquire() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(
+                        "INSERT INTO SingleBeat (`key`, `data`) VALUES (%s, %s) ON DUPLICATE KEY UPDATE `data` = VALUES(`data`)",
+                        [
+                            cmd["reply_channel"],
+                            json.dumps({
+                                "identifier": config.get_host_identifier(),
+                                "state": self.state,
+                                "info": info or "",
+                            })
+                        ]
+                    )
 
     def forward_stdout(self, buf):
         self.stdout_read_cb(buf)
